@@ -4,7 +4,7 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 let browser = null;
 
@@ -12,216 +12,146 @@ async function getBrowser() {
   if (!browser || !browser.isConnected()) {
     browser = await puppeteer.launch({
       headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-web-security',
-        '--font-render-hinting=none'
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-web-security', '--font-render-hinting=none']
     });
   }
   return browser;
 }
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'bbo-screenshot' });
+  res.json({ status: 'ok', service: 'bbo-screenshot', version: '2.0' });
 });
 
 /**
  * POST /screenshot
  * Body: {
- *   url: string,           // URL to capture
- *   viewports: [320, 768], // widths to capture
- *   fullPage: boolean,     // capture full scrollable page (default true)
- *   waitFor: number,       // ms to wait after load (default 3000)
- *   sections: boolean      // if true, split full page into ~800px tall chunks
+ *   url: string,
+ *   viewports: [320, 768],
+ *   waitFor: number (default 3000),
+ *   sections: boolean (default true),
+ *   elementMap: [{ id: "bTiYZ", name: "Hero Title", type: "Text" }, ...]
  * }
  * 
- * Returns: {
- *   screenshots: [
- *     { viewport: 320, images: ["data:image/png;base64,...", ...] },
- *     { viewport: 768, images: ["data:image/png;base64,...", ...] }
- *   ]
- * }
+ * If elementMap provided, injects visible labels on each Bubble element before capture.
+ * This lets Claude Vision know which element is which.
  */
 app.post('/screenshot', async (req, res) => {
-  const { url, viewports = [320], fullPage = true, waitFor = 3000, sections = true } = req.body;
-
+  const { url, viewports = [320], waitFor = 3000, sections = true, elementMap = null } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
 
   const startTime = Date.now();
-  console.log(`📸 Screenshot request: ${url} @ ${viewports.join(',')}px`);
+  console.log(`📸 ${url} @ ${viewports.join(',')}px ${elementMap ? '(' + elementMap.length + ' labels)' : ''}`);
 
   let page = null;
   try {
     const b = await getBrowser();
     page = await b.newPage();
 
-    // Block heavy resources to speed up loading
     await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const type = req.resourceType();
-      // Block videos, large media — keep images, styles, fonts, scripts
-      if (type === 'media') {
-        req.abort();
-      } else {
-        req.continue();
-      }
+    page.on('request', (r) => {
+      if (r.resourceType() === 'media') r.abort();
+      else r.continue();
     });
 
     const results = [];
 
     for (const vw of viewports) {
-      // Set viewport
       await page.setViewport({ width: vw, height: 900, deviceScaleFactor: 2 });
-
-      // Navigate
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-
-      // Wait for Bubble to finish rendering
       await page.waitForTimeout(waitFor);
-
-      // Scroll down slowly to trigger lazy-loaded elements
       await autoScroll(page);
-      await page.waitForTimeout(1000);
-
-      // Scroll back to top
       await page.evaluate(() => window.scrollTo(0, 0));
       await page.waitForTimeout(500);
 
-      if (sections) {
-        // Split into sections (~800px tall chunks for better Vision analysis)
-        const totalHeight = await page.evaluate(() => document.body.scrollHeight);
-        const chunkHeight = 800;
-        const images = [];
-
-        for (let y = 0; y < totalHeight; y += chunkHeight) {
-          const height = Math.min(chunkHeight, totalHeight - y);
-          const screenshot = await page.screenshot({
-            type: 'png',
-            clip: { x: 0, y, width: vw, height },
-            encoding: 'base64'
+      // Inject labels if elementMap provided
+      if (elementMap && elementMap.length > 0) {
+        const labeled = await page.evaluate((elements) => {
+          let count = 0;
+          // Bubble renders elements with class names containing the element ID
+          const allDom = document.querySelectorAll('[class]');
+          const classMap = {};
+          allDom.forEach(el => {
+            const cls = el.className;
+            if (typeof cls === 'string') {
+              for (const c of cls.split(/\s+/)) {
+                if (c.length >= 4) {
+                  if (!classMap[c]) classMap[c] = [];
+                  classMap[c].push(el);
+                }
+              }
+            }
           });
-          images.push(`data:image/png;base64,${screenshot}`);
-        }
 
+          for (const el of elements) {
+            let dom = null;
+            // Try finding by class containing the ID
+            if (classMap[el.id]) {
+              dom = classMap[el.id][0];
+            }
+            if (!dom) {
+              try { dom = document.querySelector(`[class*="${el.id}"]`); } catch(e) {}
+            }
+
+            if (dom && dom.offsetWidth > 0 && dom.offsetHeight > 0) {
+              const label = document.createElement('div');
+              const shortId = el.id.slice(0, 5);
+              const name = el.name || el.type || '';
+              label.style.cssText = 'position:absolute;top:0;left:0;background:rgba(255,30,30,0.9);color:white;font-size:8px;font-family:monospace;padding:1px 3px;border-radius:0 0 3px 0;z-index:999999;pointer-events:none;line-height:1.2;white-space:nowrap;max-width:120px;overflow:hidden;text-overflow:ellipsis;';
+              label.textContent = `${shortId} ${name}`;
+              
+              const pos = window.getComputedStyle(dom).position;
+              if (pos === 'static') dom.style.position = 'relative';
+              dom.appendChild(label);
+              count++;
+            }
+          }
+          return count;
+        }, elementMap);
+        console.log(`  🏷️ Labeled ${labeled}/${elementMap.length}`);
+        await page.waitForTimeout(200);
+      }
+
+      // Capture
+      const totalHeight = await page.evaluate(() => document.body.scrollHeight);
+      if (sections) {
+        const chunkH = 800;
+        const images = [];
+        for (let y = 0; y < totalHeight; y += chunkH) {
+          const h = Math.min(chunkH, totalHeight - y);
+          const shot = await page.screenshot({ type: 'png', clip: { x: 0, y, width: vw, height: h }, encoding: 'base64' });
+          images.push(`data:image/png;base64,${shot}`);
+        }
         results.push({ viewport: vw, images, totalHeight, chunks: images.length });
-        console.log(`  ✅ ${vw}px: ${images.length} sections (${totalHeight}px tall)`);
+        console.log(`  ✅ ${vw}px: ${images.length} sections`);
       } else {
-        // Single full-page screenshot
-        const screenshot = await page.screenshot({
-          type: 'png',
-          fullPage,
-          encoding: 'base64'
-        });
-        results.push({ viewport: vw, images: [`data:image/png;base64,${screenshot}`] });
+        const shot = await page.screenshot({ type: 'png', fullPage: true, encoding: 'base64' });
+        results.push({ viewport: vw, images: [`data:image/png;base64,${shot}`] });
         console.log(`  ✅ ${vw}px: full page`);
       }
     }
 
-    const elapsed = Date.now() - startTime;
-    console.log(`  ⏱️ Total: ${elapsed}ms`);
-
-    res.json({ screenshots: results, elapsed });
-
+    console.log(`  ⏱️ ${Date.now() - startTime}ms`);
+    res.json({ screenshots: results, elapsed: Date.now() - startTime });
   } catch (err) {
-    console.error('❌ Screenshot error:', err.message);
+    console.error('❌', err.message);
     res.status(500).json({ error: err.message });
   } finally {
     if (page) await page.close().catch(() => {});
   }
 });
 
-/**
- * POST /screenshot-with-changes
- * Same as /screenshot but injects CSS overrides to simulate responsive changes
- * Body: {
- *   url: string,
- *   viewport: number,
- *   changes: { elementId: { prop: value } }  // flat props to inject as CSS
- * }
- * 
- * This allows us to see "before" (no changes) and "after" (with changes)
- */
-app.post('/screenshot-compare', async (req, res) => {
-  const { url, viewport = 320, waitFor = 3000 } = req.body;
-
-  if (!url) return res.status(400).json({ error: 'url is required' });
-
-  let page = null;
-  try {
-    const b = await getBrowser();
-    page = await b.newPage();
-
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      if (req.resourceType() === 'media') req.abort();
-      else req.continue();
-    });
-
-    await page.setViewport({ width: viewport, height: 900, deviceScaleFactor: 2 });
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    await page.waitForTimeout(waitFor);
-    await autoScroll(page);
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(500);
-
-    // Capture current state (this is how it looks NOW — before BBO changes)
-    const totalHeight = await page.evaluate(() => document.body.scrollHeight);
-    const chunkHeight = 800;
-    const images = [];
-
-    for (let y = 0; y < totalHeight; y += chunkHeight) {
-      const height = Math.min(chunkHeight, totalHeight - y);
-      const screenshot = await page.screenshot({
-        type: 'png',
-        clip: { x: 0, y, width: viewport, height },
-        encoding: 'base64'
-      });
-      images.push(`data:image/png;base64,${screenshot}`);
-    }
-
-    console.log(`📸 Compare: ${viewport}px, ${images.length} sections`);
-    res.json({ viewport, images, totalHeight, chunks: images.length });
-
-  } catch (err) {
-    console.error('❌ Compare error:', err.message);
-    res.status(500).json({ error: err.message });
-  } finally {
-    if (page) await page.close().catch(() => {});
-  }
-});
-
-// Helper: scroll page to trigger lazy loading
 async function autoScroll(page) {
   await page.evaluate(async () => {
     await new Promise((resolve) => {
-      let totalHeight = 0;
-      const distance = 300;
-      const timer = setInterval(() => {
-        window.scrollBy(0, distance);
-        totalHeight += distance;
-        if (totalHeight >= document.body.scrollHeight) {
-          clearInterval(timer);
-          resolve();
-        }
+      let total = 0; const dist = 300;
+      const t = setInterval(() => {
+        window.scrollBy(0, dist); total += dist;
+        if (total >= document.body.scrollHeight) { clearInterval(t); resolve(); }
       }, 100);
     });
   });
 }
 
 const PORT = process.env.PORT || 3456;
-app.listen(PORT, () => {
-  console.log(`🚀 BBO Screenshot Server running on port ${PORT}`);
-  console.log(`   POST /screenshot — capture page at specified viewports`);
-  console.log(`   POST /screenshot-compare — capture for before/after comparison`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  if (browser) await browser.close();
-  process.exit(0);
-});
+app.listen(PORT, () => console.log(`🚀 BBO Screenshot Server v2.0 on port ${PORT}`));
+process.on('SIGTERM', async () => { if (browser) await browser.close(); process.exit(0); });
