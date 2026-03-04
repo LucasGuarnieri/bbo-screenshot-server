@@ -63,33 +63,31 @@ app.post('/screenshot', async (req, res) => {
       await page.evaluate(() => window.scrollTo(0, 0));
       await page.waitForTimeout(500);
 
-      // Inject labels if elementMap provided
-      if (elementMap && elementMap.length > 0) {
-        const labeled = await page.evaluate((elements) => {
-          let count = 0;
-          for (const el of elements) {
-            let dom = null;
-            // Bubble uses the element ID as a CSS class in preview mode
-            try { dom = document.querySelector('.' + el.id); } catch(e) {}
+      // Inject labels on ALL Bubble elements — auto-discover IDs from DOM
+      // Also use elementMap for name hints if provided
+      const nameMap = {};
+      if (elementMap) elementMap.forEach(e => { nameMap[e.id] = e.name || e.type || ''; });
 
-            if (dom && dom.offsetWidth > 0 && dom.offsetHeight > 0) {
-              const label = document.createElement('div');
-              const shortId = el.id.slice(0, 5);
-              const name = el.name || el.type || '';
-              label.style.cssText = 'position:absolute;top:0;left:0;background:rgba(255,30,30,0.9);color:white;font-size:8px;font-family:monospace;padding:1px 3px;border-radius:0 0 3px 0;z-index:999999;pointer-events:none;line-height:1.2;white-space:nowrap;max-width:120px;overflow:hidden;text-overflow:ellipsis;';
-              label.textContent = `${shortId} ${name}`;
-              
-              const pos = window.getComputedStyle(dom).position;
-              if (pos === 'static') dom.style.position = 'relative';
-              dom.appendChild(label);
-              count++;
-            }
+      const labeled = await page.evaluate((names) => {
+        const skip = new Set(['flex','column','row','main-page','bubble-r-container','bubble-r-vertical-center','bubble-element','selected','clickable-element']);
+        let count = 0;
+        document.querySelectorAll('.bubble-element').forEach(el => {
+          const classes = el.className.split(' ');
+          const id = classes.find(c => /^[a-z][A-Za-z0-9]{3,}$/.test(c) && !skip.has(c) && !c.startsWith('bubble') && !c.includes('-'));
+          if (id && el.offsetWidth > 0) {
+            const label = document.createElement('div');
+            const name = names[id] || '';
+            label.style.cssText = 'position:absolute;top:0;left:0;background:rgba(255,30,30,0.9);color:white;font-size:9px;font-family:monospace;padding:1px 4px;border-radius:0 0 3px 0;z-index:999999;pointer-events:none;line-height:1.3;white-space:nowrap;';
+            label.textContent = name ? id + ' ' + name : id;
+            el.style.position = 'relative';
+            el.appendChild(label);
+            count++;
           }
-          return count;
-        }, elementMap);
-        console.log(`  🏷️ Labeled ${labeled}/${elementMap.length}`);
-        await page.waitForTimeout(200);
-      }
+        });
+        return count;
+      }, nameMap);
+      console.log(`  🏷️ Labeled ${labeled} elements`);
+      await page.waitForTimeout(300);
 
       // Capture
       const totalHeight = await page.evaluate(() => document.body.scrollHeight);
