@@ -67,30 +67,10 @@ app.post('/screenshot', async (req, res) => {
       if (elementMap && elementMap.length > 0) {
         const labeled = await page.evaluate((elements) => {
           let count = 0;
-          // Bubble renders elements with class names containing the element ID
-          const allDom = document.querySelectorAll('[class]');
-          const classMap = {};
-          allDom.forEach(el => {
-            const cls = el.className;
-            if (typeof cls === 'string') {
-              for (const c of cls.split(/\s+/)) {
-                if (c.length >= 4) {
-                  if (!classMap[c]) classMap[c] = [];
-                  classMap[c].push(el);
-                }
-              }
-            }
-          });
-
           for (const el of elements) {
             let dom = null;
-            // Try finding by class containing the ID
-            if (classMap[el.id]) {
-              dom = classMap[el.id][0];
-            }
-            if (!dom) {
-              try { dom = document.querySelector(`[class*="${el.id}"]`); } catch(e) {}
-            }
+            // Bubble uses the element ID as a CSS class in preview mode
+            try { dom = document.querySelector('.' + el.id); } catch(e) {}
 
             if (dom && dom.offsetWidth > 0 && dom.offsetHeight > 0) {
               const label = document.createElement('div');
